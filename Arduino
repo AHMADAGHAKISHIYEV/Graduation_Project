@@ -1,0 +1,46 @@
+#include <Talkie.h>
+#include "Vocab_US_Large.h" // Eski sürüm ses tanımlamaları
+
+const int yesilLedler[] = {13, 11, 9, 7};
+const int kirmiziLedler[] = {12, 10, 8, 6};
+const int hoparlorPin = 3;
+
+Talkie voice;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(hoparlorPin, OUTPUT);
+  
+  for (int i = 0; i < 4; i++) {
+    pinMode(yesilLedler[i], OUTPUT);
+    pinMode(kirmiziLedler[i], OUTPUT);
+    digitalWrite(yesilLedler[i], LOW);
+    digitalWrite(kirmiziLedler[i], LOW);
+  }
+  
+  voice.say(sp4_READY); // 
+}
+
+void loop() {
+  if (Serial.available()) {
+    char durum = Serial.read();
+    
+    if (durum == 'G') {
+      ledDurumuAyarla(yesilLedler, true);
+      ledDurumuAyarla(kirmiziLedler, false);
+      voice.say(sp4_BRAVO); // "Good" sesi
+    } 
+    else if (durum == 'R') {
+      ledDurumuAyarla(yesilLedler, false);
+      ledDurumuAyarla(kirmiziLedler, true);
+      voice.say(sp4_WARNING); // "Warning" sesi
+    }
+  }
+  delay(100);
+}
+
+void ledDurumuAyarla(const int ledler[], bool durum) {
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(ledler[i], durum ? HIGH : LOW);
+  }
+}
