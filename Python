@@ -1,0 +1,431 @@
+import logging #API'ye istek göndermek için gerekli kütüphan
+import sqlite3 
+import requests #Hata mesajlarını kaydetmek için kullanılır
+import matplotlib.pyplot as plt
+import io
+import serial
+import time
+from datetime import datetime
+from telegram import Update 
+from telegram.ext import Updater, CommandHandler, CallbackContext
+#Veritabanı İşlemleri
+def vt_olustur():  #veritabanını oluşturur veya var olan veritabanını açar
+    baglanti = sqlite3.connect("crypto_bot.db")  #crypto_bot.db adlı veritabanına bağlantı oluşturma
+    imlec = baglanti.cursor()  #veritabanında sorgu çalıştırmak için imleç oluşturma
+    imlec.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY,coins TEXT)''')  #eğer "users" adlı tablo yoksa, oluştur
+    imlec.execute('''CREATE TABLE IF NOT EXISTS investments
+                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   user_id INTEGER,
+                   coin_id TEXT,
+                   amount REAL,
+                   initial_price REAL,
+                   last_price REAL,
+                   timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    imlec.execute("SELECT * FROM users")
+    print(imlec.fetchall())  # Tüm kayıtları göster
+    baglanti.commit()  #yapılan değişiklikleri kaydetme
+    baglanti.close()  #veritabanı bağlantısını kapatma 
+    
+def kullanici_coinlerini_al(user_id):
+    baglanti = sqlite3.connect("crypto_bot.db")
+    imlec = baglanti.cursor()
+    imlec.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,))
+    sonuc = imlec.fetchone()
+    baglanti.commit()
+    baglanti.close()
+    
+    if sonuc is None:
+        return []
+    return sonuc[0].split(',') if sonuc[0] else []
+  
+    
+def kullanici_coinlerini_ayarla(user_id, coins):
+    baglanti = sqlite3.connect("crypto_bot.db")
+    imlec = baglanti.cursor()
+    coinler_string = ",".join(coins)
+    imlec.execute("INSERT INTO users (user_id, coins) VALUES (?, ?)", 
+              (user_id, coinler_string))
+    baglanti.commit()
+    baglanti.close()
+    
+def coin_fiyati_al(coin_id): #Bu fonksiyon, verilen coin_id'nin fiyatını getirir 
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"  #Coingeckodan'den fiyat verisi almak için kullanılacak URL oluşturuluyor 
+    try:
+        response = requests.get(url)   #Coingecko'ye HTTP GET isteği gönderiliyor
+        data = response.json() #Coingecko'den dönen yanıt JSON formatına çevriliyor
+        return data[coin_id]['usd']  #JSON verisinden ilgili coinin USD fiyatı alınıyor ve döndürülüyor
+    except Exception as e:  #Coingeckoda bir hata olursa bu blok çalışır
+        logging.error(f"API Hatası: {e}") #Hata mesajını log dosyasına kaydeder
+        return None  #Hata durumunda None döndürerek fonksiyonun çalışmasını güvenli hale getirir  
+    
+
+# Telegram Bot Komutları
+
+# Kullanıcı botu başlattığında çalışır ve botun aktif olduğunu bildirir.
+def baslat(update: Update, context: CallbackContext):  
+    update.message.reply_text("Kripto Analiz Botuna hoş geldiniz! Bu komutları kullanarak işlem yapa bilirsiniz .\n /coin_ekle \n /coin_sil \n /fiyat \n /coinlerim \n /yatirim_yap \n /yatirimlarim \n /yatirim_durdur \n /grafik \n /temizle")  # Kullanıcıya botun aktif olduğu mesajını gönderir.
+
+# Kullanıcının takip etmek istediği coinleri eklemesini sağlayan fonksiyon.
+def coin_ekle(update: Update, context: CallbackContext):
+    try:
+        user_id = update.message.from_user.id # Kullanıcının kimliğini alır.
+        print("User ID:", user_id)
+        user_input = update.message.text.split("/coin_ekle ")[1]  # Kullanıcının girdiği coin listesini alır.
+        yeni_coinler = [coin.strip().lower() for coin in user_input.split(",")]  # Girilen coinleri düzenleyerek küçük harfe çevirir.
+        
+        mevcut_coinler = kullanici_coinlerini_al(user_id)  # Kullanıcının mevcut coin listesini alır.
+        guncel_coinler = list(set(mevcut_coinler + yeni_coinler))  # Mevcut ve yeni coinleri birleştirerek tekrarları önler.
+        
+        kullanici_coinlerini_ayarla(user_id, guncel_coinler)  # Güncellenmiş coin listesini kaydeder.
+        
+        if user_input in mevcut_coinler:
+            update.message.reply_text("Bu coin listenizde mevcut") 
+        else:
+            update.message.reply_text(f"Başarıyla eklendi: {', '.join(yeni_coinler)}\n"
+                                 f"Güncel listeniz: {', '.join(guncel_coinler)}")
+    except IndexError:
+        update.message.reply_text("Hatalı format! Lütfen şu şekilde girin:\n"
+                                  "/coin_ekle bitcoin,ethereum,solana")  # Kullanıcı yanlış giriş yaptığında uyarı mesajı gönderir.
+
+# Kullanıcının takip listesinden coin silmesini sağlayan fonksiyon.
+def coin_sil(update: Update, context: CallbackContext):
+    try:
+        user_id = update.message.from_user.id  # Kullanıcının kimliğini alır.
+        user_input = update.message.text.split("/coin_sil ")[1]  # Kullanıcının girdiği coin listesini alır.
+        silinecek_coinler = [coin.strip().lower() for coin in user_input.split(",")]  # Girilen coinleri düzenleyerek küçük harfe çevirir.
+
+        mevcut_coinler = kullanici_coinlerini_al(user_id)  # Kullanıcının mevcut coin listesini alır.
+        
+        # Silinecek coinleri mevcut listeden çıkararak güncellenmiş listeyi oluşturur.
+        guncel_coinler = [coin for coin in mevcut_coinler if coin not in silinecek_coinler]
+        
+        # Eğer hiçbir coin silinmemişse, kullanıcıyı bilgilendirir.
+        if len(guncel_coinler) == len(mevcut_coinler):
+            bulunamayanlar = [coin for coin in silinecek_coinler if coin not in mevcut_coinler]  # Kullanıcının listesinde olmayan coinleri belirler.
+            update.message.reply_text(f"Şu coinler listenizde yok: {', '.join(bulunamayanlar)}")  # Kullanıcıyı bilgilendirir.
+            return
+
+        kullanici_coinlerini_ayarla(user_id, guncel_coinler)  # Güncellenmiş coin listesini kaydeder.
+        update.message.reply_text(f"Başarıyla silindi: {', '.join(silinecek_coinler)}\n"
+                                 f"Güncel listeniz: {', '.join(guncel_coinler)}")  # Kullanıcıya güncellenmiş listesini gösterir.
+    
+    except IndexError:
+        update.message.reply_text("Hatalı format! Lütfen şu şekilde girin:\n"
+                                  "/coin_sil bitcoin,ethereum")  # Kullanıcı yanlış giriş yaptığında uyarı mesajı gönderir.
+
+# Kullanıcının eklediği tüm coinleri listeleyen fonksiyon.
+def coinlerim(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id  # Kullanıcının kimliğini alır.
+    coinler = kullanici_coinlerini_al(user_id)  # Kullanıcının kayıtlı coin listesini alır.
+    
+    if coinler:
+        update.message.reply_text(f" Kayıtlı Coinleriniz:\n{', '.join(coinler)}")  # Kullanıcının coin listesini gösterir.
+    else:
+        update.message.reply_text("ℹ Henüz kayıtlı coininiz yok. /coin_ekle ile ekleyin!")  # Kullanıcının coin listesi boşsa bilgilendirir.
+
+# Botun ana fonksiyonu, Telegram botunu başlatır ve komutları tanımlar.
+def fiyat_bilgisi(update: Update, context: CallbackContext):
+    try:
+        # Kullanıcının girdiği coin listesini alma
+        user_input = update.message.text.split("/fiyat ")[1].strip()
+        coin_listesi = [coin.strip().lower() for coin in user_input.split(",")]
+        
+        # Fiyat bilgilerini toplama
+        mesaj = " Anlık Fiyat Bilgileri:\n\n"
+        for coin in coin_listesi:
+            fiyat = coin_fiyati_al(coin)
+            if fiyat is not None:
+                mesaj += f"• {coin.upper()}: ${fiyat:.10f}\n"
+            else:
+                mesaj += f"• {coin.upper()}: Veri alınamadı\n"
+        
+        update.message.reply_text(mesaj)
+    
+    except IndexError:
+        update.message.reply_text(" Lütfen coinleri virgülle ayırarak belirtin!\nÖrnek kullanım: /fiyat bitcoin,ethereum")
+        
+def yatirim_yap(update: Update, context: CallbackContext):
+    try:
+        # Kullanıcı bilgilerini ve komut parametrelerini al
+        user_id = update.message.from_user.id
+        args = context.args
+        
+        # Eksik parametre kontrolü (en az 2 parametre olmalı)
+        if len(args) < 2:
+            raise ValueError  # Hata fırlat
+        
+        # Coin adını küçük harfe çevir
+        coin_id = args[0].lower()
+        # Yatırım miktarını ondalıklı sayıya çevir
+        amount = float(args[1])
+        
+        # Coin'in anlık fiyatını API'den al
+        current_price = coin_fiyati_al(coin_id)
+        if not current_price:  # Fiyat alınamazsa
+            update.message.reply_text("Geçersiz coin veya fiyat bilgisi alınamadı!")
+            return  # Fonksiyonu sonlandır
+
+        # Veritabanı bağlantısını aç
+        baglanti = sqlite3.connect("crypto_bot.db")
+        imlec = baglanti.cursor()
+        
+        # Yeni yatırımı veritabanına ekle
+        imlec.execute('''INSERT INTO investments 
+                      (user_id, coin_id, amount, initial_price, last_price)
+                      VALUES (?, ?, ?, ?, ?)''',
+                   (user_id, coin_id, amount, current_price, current_price))
+        
+        # Eklenen yatırımın ID'sini al
+        investment_id = imlec.lastrowid
+        baglanti.commit()  # Değişiklikleri kaydet
+        baglanti.close()  # Bağlantıyı kapat
+
+        # Her 30 saniyede bir güncelleme görevi planla
+        context.job_queue.run_repeating(
+            yatirim_guncelle, 
+            interval=30,  # 30 saniye aralık
+            first=0,  # İlk çalışma hemen olsun
+            context={  # Görev bağlam verileri
+                'user_id': user_id,
+                'investment_id': investment_id,
+                'coin_id': coin_id,
+                'amount': amount
+            }
+        )
+        
+        # Kullanıcıya onay mesajı gönder
+        update.message.reply_text(
+            f"✅ {amount} {coin_id.upper()} yatırımı kaydedildi!\n"
+            f"Başlangıç Fiyatı: ${current_price:.4f}"
+        )
+        
+    except (ValueError, IndexError):
+        # Hatalı giriş formatı durumunda bilgilendirme
+        update.message.reply_text("Hatalı format! Doğru kullanım:\n/yatirim_yap <coin> <miktar>\nÖrnek: /yatirim_yap bitcoin 0.5")
+def yatirim_guncelle(context: CallbackContext):
+    # Zamanlanmış görev bilgilerini al
+    job = context.job
+    user_id = job.context['user_id']
+    investment_id = job.context['investment_id']
+    coin_id = job.context['coin_id']
+    amount = job.context['amount']
+    
+    # Coin'in güncel fiyatını al
+    current_price = coin_fiyati_al(coin_id)
+    if not current_price:  # Fiyat alınamazsa
+        return  # Fonksiyonu sonlandır
+
+    # Veritabanı bağlantısını aç
+    baglanti = sqlite3.connect("crypto_bot.db")
+    imlec = baglanti.cursor()
+    
+    # Son kayıtlı fiyatı veritabanından çek
+    imlec.execute("SELECT last_price FROM investments WHERE id=?", (investment_id,))
+    last_price = imlec.fetchone()[0]  # İlk sonucun ilk değerini al
+    
+    # Yüzdelik değişimi hesapla
+    change_pct = ((current_price - last_price) / last_price) * 100
+    # Değişim yönüne göre emoji seç
+    change_emoji = "🟢 ▲" if change_pct >= 0 else "🔴 ▼"
+    
+    # Değer hesaplamaları yap
+    current_value = amount * current_price  # Güncel toplam değer
+    value_change = current_value - (amount * last_price)  # Değişim miktarı
+    
+    # Mesajı formatla
+    message = (
+        f"{coin_id.upper()} Yatırım Güncellemesi:\n"
+        f"┌ Mevcut Fiyat: ${current_price:.4f}\n"
+        f"├ Son 10 saniye: {change_emoji} {abs(change_pct):.2f}%\n"
+        f"├ Toplam Değer: ${current_value:.2f}\n"
+        f"└ Değişim: {'+' if value_change >=0 else ''}{value_change:.2f}$"
+    )
+    
+    # Veritabanındaki son fiyatı güncelle
+    imlec.execute("UPDATE investments SET last_price=? WHERE id=?", (current_price, investment_id))
+    baglanti.commit()  # Değişiklikleri kaydet
+    baglanti.close()  # Bağlantıyı kapat
+    
+    # Kullanıcıya mesaj gönder
+    context.bot.send_message(chat_id=user_id, text=message)
+    
+    try:
+        # Arduino iletişimi için seri portu aç
+        print(f"Arduino'ya gönderiliyor: {'G' if change_pct >=0 else 'R'}")
+        arduino = serial.Serial('COM3', 9600)  # Port ve baud rate ayarı
+        time.sleep(2)  # Bağlantı için bekle
+        arduino.write(b'G' if change_pct >=0 else b'R')  # Duruma göre sinyal gönder
+        arduino.close()  # Bağlan       tıyı kapat
+    except Exception as e:
+        print("Arduino Hatası:", str(e))  # Hata mesajını konsola yaz
+    
+def aktif_yatirimlari_al(user_id):
+    # Veritabanı bağlantısını aç
+    baglanti = sqlite3.connect("crypto_bot.db")
+    imlec = baglanti.cursor()
+    
+    # Kullanıcının tüm aktif yatırımlarını sorgula
+    imlec.execute("SELECT id, coin_id, amount FROM investments WHERE user_id=?", (user_id,))
+    yatirimlar = imlec.fetchall()  # Tüm sonuçları al
+    
+    baglanti.close()  # Bağlantıyı kapat
+    
+    return yatirimlar  # (id, coin_id, amount) tuple listesi döndür
+
+def yatirimlarim(update: Update, context: CallbackContext):
+    # Komutu gönderen kullanıcının ID'sini al
+    user_id = update.message.from_user.id
+    
+    # Veritabanından kullanıcının aktif yatırımlarını çek
+    yatirimlar = aktif_yatirimlari_al(user_id)
+    
+    # Eğer yatırım yoksa bilgilendir ve çık
+    if not yatirimlar:
+        update.message.reply_text("📭 Aktif yatırımınız bulunmamaktadır.")
+        return  # Fonksiyonu sonlandır
+        
+    # Mesajı oluşturmaya başla
+    mesaj = "🔍 Aktif Yatırımlarınız:\n\n"
+    
+    # Her yatırımı mesaja ekle
+    for yatirim in yatirimlar:
+        # Format: ID | COIN | Miktar
+        mesaj += f"ID: {yatirim[0]} | {yatirim[1].upper()} | Miktar: {yatirim[2]}\n"
+    
+    # Durdurma talimatını ekle
+    mesaj += "\n🚫 Durdurmak için: /yatirim_durdur <ID>"
+    
+    # Mesajı kullanıcıya gönder
+    update.message.reply_text(mesaj)
+
+def yatirim_durdur(update: Update, context: CallbackContext):
+    try:
+        # Kullanıcı ve girilen ID'yi al
+        user_id = update.message.from_user.id
+        yatirim_id = int(context.args[0])  # ID'yi sayıya çevir
+        
+        # Tüm aktif işleri kontrol et
+        for job in context.job_queue.jobs():
+            # İşin bağlamındaki bilgileri kontrol et
+            if (
+                job.context.get('investment_id') == yatirim_id 
+                and job.context['user_id'] == user_id
+            ):
+                # Eşleşen işi kuyruktan kaldır
+                job.schedule_removal()
+                update.message.reply_text(f"✅ ID: {yatirim_id} bildirimler durduruldu.")
+                return  # İşlem tamamlandı, fonksiyondan çık
+        
+        # Eşleşme bulunamazsa uyar
+        update.message.reply_text("❌ Geçersiz ID veya zaten durduruldu.")
+        
+    except (IndexError, ValueError):
+        # Hatalı format durumunda kullanıcıyı bilgilendir
+        update.message.reply_text(
+            "⚠️ Hatalı format! Doğru kullanım:\n"
+            "/yatirim_durdur <ID>\n"
+            "Örnek: /yatirim_durdur 5"
+        )
+        
+def fiyat_grafigi(update: Update, context: CallbackContext):
+    try:
+        # Kullanıcının girdiği coin adını al ve temizle (örnek: "/grafik bitcoin 30")
+        coin_id = context.args[0].lower().strip()
+        
+        # Kullanıcı gün sayısı belirtmemişse varsayılan 7 gün kullan
+        gun_sayisi = int(context.args[1]) if len(context.args) > 1 else 7
+
+        # CoinGecko API'den tarihsel verileri çek
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days={gun_sayisi}"
+        response = requests.get(url)  # API'ye GET isteği gönder
+        data = response.json()  # Gelen JSON verisini çevir
+
+        # API'den gelen fiyat ve zaman verilerini işle:
+        fiyatlar = [entry[1] for entry in data['prices']]  # Her zaman noktasındaki fiyatı al
+        zamanlar = [datetime.fromtimestamp(entry[0]/1000) for entry in data['prices']]  # zaman damgasını datetime'a çevir
+
+        # Matplotlib ile grafik oluştur:
+        plt.figure(figsize=(10, 6))  # 10x6 inç boyutunda grafik
+        plt.plot(zamanlar, fiyatlar, linewidth=2, color='#4B8BBE')  # Mavi çizgi ile fiyatları çiz
+        plt.title(f"{coin_id.upper()} Fiyat Grafiği ({gun_sayisi} Gün)", fontsize=14, pad=20)  # Başlık ekle
+        plt.xlabel("Tarih", fontsize=12)  # X ekseni etiketi
+        plt.ylabel("Fiyat (USD)", fontsize=12)  # Y ekseni etiketi
+        plt.grid(True, alpha=0.3)  # %30 opaklıkta grid çizgileri
+        plt.xticks(rotation=45)  # Tarih etiketlerini 45 derece döndür
+        plt.tight_layout()  # Grafik elementlerini sıkı yerleştir
+
+        # Grafiği bellekte sakla:
+        buf = io.BytesIO()  # Bellek üzerinde binary dosya oluştur
+        plt.savefig(buf, format='png', dpi=150)  # 150 DPI çözünürlükte PNG olarak kaydet
+        buf.seek(0)  # Dosya imlecini başa al
+        plt.close()  # Grafik penceresini kapat
+
+        # Kullanıcıya grafiği fotoğraf olarak gönder:
+        update.message.reply_photo(
+            photo=buf,  # Bellekteki görsel dosyası
+            caption=f" {coin_id.upper()} {gun_sayisi} Günlük Fiyat Grafiği",  # Açıklama metni
+            parse_mode='Markdown'  # Metin formatlama için Markdown kullan
+        )
+        
+    except IndexError:
+        # Kullanıcı eksik parametre girmişse hata mesajı gönder
+        update.message.reply_text(" Hatalı format! Doğru kullanım:\n/grafik <coin_adi> <gün_sayısı>")
+    except Exception as e:
+        # Diğer tüm hataları logla ve kullanıcıyı bilgilendir
+        logging.error(f"Grafik Hatası: {e}")
+        update.message.reply_text(" Grafik oluşturulurken bir hata oluştu")
+def yatirimlarimi_temizle(update: Update, context: CallbackContext):
+    # Komutu gönderen kullanıcının ID'sini al
+    user_id = update.message.from_user.id
+    
+    try:
+        # Veritabanı bağlantısını aç
+        conn = sqlite3.connect('crypto_bot.db')
+        c = conn.cursor()
+        
+        # 1. ADIM: Bu kullanıcının tüm yatırım kayıtlarını sil
+        c.execute("DELETE FROM investments WHERE user_id=?", (user_id,))
+        
+        # 2. ADIM: Yeni ID'leri düzenle (SQLite çözümü)
+        # Tüm tablodaki en yüksek ID'yi bul
+        c.execute("SELECT MAX(id) FROM investments")
+        max_id = c.fetchone()[0] or 0  # Eğer hiç kayıt yoksa 0 kullan
+        
+        # Bir sonraki ID'yi mevcut maksimum +1 olarak ayarla
+        new_sequence = max_id + 1
+        # SQLite'ın otomatik artan ID sistemini güncelle
+        c.execute("UPDATE sqlite_sequence SET seq=? WHERE name='investments'", (new_sequence,))
+        
+        # Değişiklikleri kaydet ve bağlantıyı kapat
+        conn.commit()
+        conn.close()
+        
+        # Kullanıcıya başarı mesajı gönder
+        update.message.reply_text(" Yatırım geçmişiniz temizlendi! Yeni ID'leriniz özel sıralamayla başlayacak.")
+        
+    except Exception as e:
+        # Herhangi bir hata durumunda kullanıcıyı bilgilendir
+        update.message.reply_text(f"⛔ Hata: {str(e)}") 
+
+
+def main():
+    vt_olustur()  # Veritabanını oluşturur veya mevcutsa açar.
+    
+    updater = Updater(token="", use_context=True)  # Telegram botu için Updater nesnesi oluşturur.
+    dispatcher = updater.dispatcher  # Komutları yönetmek için Dispatcher nesnesi oluşturur.
+    dispatcher.add_handler(CommandHandler("baslat", baslat))  # /baslat komutunu bağlar.
+    dispatcher.add_handler(CommandHandler("coin_ekle", coin_ekle))  # /coin_ekle komutunu bağlar.
+    dispatcher.add_handler(CommandHandler("coin_sil", coin_sil)) # /coin_sil
+    dispatcher.add_handler(CommandHandler("coinlerim", coinlerim))  # /coinlerim komutunu bağlar.
+    dispatcher.add_handler(CommandHandler("fiyat", fiyat_bilgisi))
+    dispatcher.add_handler(CommandHandler("yatirim_yap", yatirim_yap, pass_args=True))
+    dispatcher.add_handler(CommandHandler("yatirimlarim", yatirimlarim))
+    dispatcher.add_handler(CommandHandler("yatirim_durdur", yatirim_durdur, pass_args=True))
+    dispatcher.add_handler(CommandHandler("grafik", fiyat_grafigi, pass_args=True))
+    dispatcher.add_handler(CommandHandler("temizle", yatirimlarimi_temizle))
+    updater.start_polling()  # Botu başlatır ve gelen mesajları dinlemeye başlar.
+    updater.idle()  # Botun çalışmaya devam etmesini sağlar.
+    
+
+if __name__ == "__main__":
+    main()
